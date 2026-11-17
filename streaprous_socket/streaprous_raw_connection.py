@@ -25,8 +25,23 @@ import sys
 import threading
 import time
 import queue
-from collections import namedtuple
+from collections import namedtuple, OrderedDict
 import netifaces
+from dataclasses import dataclass
+from enum import Enum
+
+
+MSS = 1400       # Leave room for IP/TCP headers within 1500B MTU
+MAX_RECV_BUFFER_BYTES = 65535
+DEFAULT_TCP_WINDOW_BYTES = 65535    # Max 16-bit TCP window size
+SEQ_NUMBER_MASK = 0xFFFFFFFF      # 32-bit sequence wrap mask
+
+INITIAL_CWND_SEGMENTS = 2
+INITIAL_RTO_SEC = 1.0
+MIN_RTO_SEC = 0.2
+MAX_RTO_SEC = 60.0
+RTT_EWMA_ALPHA = 0.125              # SRTT smoothing factor
+RTT_EWMA_BETA = 0.25                # RTTVAR smoothing factor
 
 # Import streaprout packet dispatcher functions
 from .streaprous_packet_dispatcher import (
@@ -39,6 +54,12 @@ from .streaprous_packet_dispatcher import (
 )
 
 
+class CongestionState(Enum):
+    SLOW_START = "SLOW_START"
+    CONGESTION_AVOIDANCE = "CONGESTION_AVOIDANCE"
+    FAST_RECOVERY = "FAST_RECOVERY"
+
+    
 # Connection structure 
 # This structure holds connection and its state information
 conn_struct = namedtuple('conn_struct', [
@@ -50,12 +71,8 @@ conn_struct = namedtuple('conn_struct', [
     'server_seq',
     'client_seq',
     'expected_final_ack',
-<<<<<<< HEAD
-    'last_activity'
-=======
     'last_activity',
     'window_size',
->>>>>>> 064a9f7 (add flow-control)
 ])
 
 
@@ -146,7 +163,7 @@ def checksum(msg):
     return ~s & 0xffff
 
 
-def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0):
+def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0, window = DEFAULT_TCP_WINDOW_BYTES):
     """Stitches a structurally flawless 20-byte TCP header.
 
     Args:
@@ -162,7 +179,7 @@ def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, a
     """
     flags = (ack << 4) + (syn << 1) + fin
     offset_res = (5 << 4) + 0  # 20 bytes data offset (5 * 4)
-    window = 5840
+    # window = 5840
     urg_ptr = 0
     draft_checksum = 0
 
@@ -232,7 +249,7 @@ def build_ip_header(src_ip, dest_ip, protocol, payload_len):
     return ip_header
 
 
-def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, payload):
+def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, payload, window):
     """Assembles and transmits a single TCP segment containing data payload.
 
     Args:
@@ -253,7 +270,7 @@ def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, 
     #       need to modify in full schema
     flags = 0x18
     offset_res = (5 << 4) + 0
-    window = 5840
+    # window = 5840
     urg_ptr = 0
     draft_checksum = 0
     
@@ -421,16 +438,13 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
 
             # Unpack the received TCP header
             tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-<<<<<<< HEAD
-            src_port, dest_port, pkt_seq, pkt_ack, flags = (
-=======
             src_port, dest_port, pkt_seq, pkt_ack, flags, first_pkt_window = (
->>>>>>> 064a9f7 (add flow-control)
                 tcph[0],
                 tcph[1],
                 tcph[2],
                 tcph[3],
                 tcph[5],
+                tcph[6],
             )
 
             # Bypass non-listen port
@@ -504,7 +518,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_port=listen_port,
                         state="SYN_RCVD",
                         server_seq=server_seq,
-                        client_seq=pkt_seq,
+                        client_seq=pkt_seq, 
                         expected_final_ack=server_seq + 1,
                         last_activity=time.time()
                         window_size=first_pkt_window,
@@ -531,16 +545,13 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
 
                     # Unpack the received TCP header
                     tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-<<<<<<< HEAD
-                    src_port, dest_port, pkt_seq, pkt_ack, flags = (
-=======
                     src_port, dest_port, pkt_seq, pkt_ack, flags, pkt_window = (
->>>>>>> 064a9f7 (add flow-control)
                         tcph[0],
                         tcph[1],
                         tcph[2],
                         tcph[3],
                         tcph[5],
+                        tcph[6],
                     )
 
                     syn_flag = (flags & 0x02) >> 1
@@ -630,6 +641,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
             handshake_in_progress.clear()
         raise
 
+recv_buffers={}
 
 def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
     """
@@ -672,12 +684,13 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
 
             # Unpack the received TCP header
             tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-            src_port, dest_port, pkt_seq, pkt_ack, flags = (
+            src_port, dest_port, pkt_seq, pkt_ack, flags, = (
                 tcph[0],
                 tcph[1],
                 tcph[2],
                 tcph[3],
                 tcph[5],
+                
             )
 
             # Bypass non-listen port
@@ -700,7 +713,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                 if client_key not in connections:
                     continue
                 session = connections[client_key]
-
+                recv_buffers.setdefault(client_key, {'in_order': bytearray(), 'out_of_order': {}})      
             # Handle FIN (connection close)
             if fin_flag:
                 print(f"[Streap_raw] Received FIN from {client_ip}:{client_port}")
@@ -713,6 +726,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                 with connections_lock:
                     if client_key in connections:
                         del connections[client_key]
+                        del recv_buffers[client_key]
                 # Clean up packet queue
                 remove_packet_queue(client_key)
                 return b""
@@ -723,6 +737,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                 with connections_lock:
                     if client_key in connections:
                         del connections[client_key]
+                        del recv_buffers[client_key]
                 # Clean up packet queue
                 remove_packet_queue(client_key)
                 return b""
@@ -740,16 +755,35 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                 # Dynamically look up header length to bypass any incoming TCP Options
                 tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
                 app_payload = tcp_packet[tcp_header_len:]
-                
+
                 if len(app_payload) > 0:
                     print(f"[Streap_raw] Received {len(app_payload)} bytes of data from {client_ip}:{client_port}")
                     print(f"[Streap_raw] Received payload: {app_payload[:100]}...")
-                    
+                    data_return = b""
+                    expected_seq = session.client_seq
+                    if pkt_seq == expected_seq: #in_order
+                        recv_buffers[client_key]['in_order'] += app_payload
+                        next_ack = pkt_seq + len(app_payload)
+                        while next_ack in recv_buffers[client_key]['out_of_order']:
+                            payload = recv_buffers[client_key]['out_of_order'].pop(next_ack)
+                            recv_buffers[client_key]['in_order'] += payload
+                            next_ack += len(payload)
+                        used_buffer = len(recv_buffers[client_key]['in_order']) + sum(len(v) for v in recv_buffers[client_key]['out_of_order'].values())
+                        rwnd = max(0, min(DEFAULT_TCP_WINDOW_BYTES, MAX_RECV_BUFFER_BYTES - used_buffer))
+                        data_return = bytes(recv_buffers[client_key]['in_order'])
+                        recv_buffers[client_key]['in_order'].clear()
+                    elif pkt_seq > expected_seq: #out_of_order
+                        recv_buffers[client_key]['out_of_order'][pkt_seq] = app_payload
+                        out_of_order_size = sum(len(v) for v in recv_buffers[client_key]['out_of_order'].values())
+                        used_buffer = len(recv_buffers[client_key]['in_order']) + out_of_order_size
+                        rwnd = max(0, min(DEFAULT_TCP_WINDOW_BYTES, MAX_RECV_BUFFER_BYTES - used_buffer))
+                        next_ack = expected_seq
                     # Send ACK for received data IMMEDIATELY (fast path)
-                    next_ack = pkt_seq + len(app_payload)
-                    
+                    # next_ack = pkt_seq + len(app_payload)
+                    else:
+                        next_ack = expected_seq
                     ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
-                                                  seq=session.server_seq, ack_seq=next_ack, ack=1)
+                                                  seq=session.server_seq, ack_seq=next_ack, ack=1, window = rwnd)
                     ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
                     s.sendto(ip_header + ack_packet, (client_ip, 0))
                     print(f"[Streap_raw] Sent ACK for data (Ack={next_ack})")
@@ -764,7 +798,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                             )
                         
                     # Return the received payload
-                    return app_payload
+                    return data_return
 
             # Handle pure ACK (no data)
             elif ack_flag and not syn_flag and not psh_flag and not has_data:
@@ -807,8 +841,6 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
             print(f"[Streap_raw] run_conn_send Connection not found for {client_ip}:{client_port}")
             return -1
         session = connections[client_key]
-<<<<<<< HEAD
-=======
     offset = 0
     payload_len = len(payload)
     initial_seq = session.server_seq
@@ -821,27 +853,9 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
     packet_queue = get_packet_queue(client_key)
 
     unacked_segments= {}
->>>>>>> 064a9f7 (add flow-control)
     
+    MSS = 1460
     try:
-<<<<<<< HEAD
-        bytes_sent = send_tcp_data_segment(
-            s, listen_ip, client_ip, listen_port, client_port,
-            seq=session.server_seq, ack_seq=session.client_seq, payload=payload
-        )
-        
-        print(f"[Streap_raw] run_conn_send Sent {bytes_sent} bytes to {client_ip}:{client_port}")
-        
-        # Update sequence numbers
-        with connections_lock:
-            if client_key in connections:
-                connections[client_key] = session._replace(
-                    server_seq=session.server_seq + bytes_sent,
-                    last_activity=time.time()
-                )
-        
-        return bytes_sent
-=======
         while send_base < target:
             with connections_lock:
                 if client_key not in connections:
@@ -1013,7 +1027,6 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                 
         
         return payload_len
->>>>>>> 064a9f7 (add flow-control)
         
     except Exception as e:
         print(f"[Streap_raw] run_conn_send Error in run_conn_send: {e}")
@@ -1047,8 +1060,6 @@ def close_all_connections():
     """Close all connections and clean up."""
     with connections_lock:
         connections.clear()
-<<<<<<< HEAD
-=======
 
 # Feature: Implement TCP flow control and window management
 def get_local_rwnd(recv_buffer, client_key) -> int:
@@ -1076,4 +1087,3 @@ def get_available_send_bytes(self) -> int:
         effective_window = min(int(self.cwnd_bytes), self.peer_rwnd)
         in_flight = (self.next_send_seq - self.oldest_unacked_seq) & SEQ_NUMBER_MODULO
         return max(0, effective_window - in_flight)
->>>>>>> 064a9f7 (add flow-control)
