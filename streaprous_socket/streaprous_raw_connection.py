@@ -50,7 +50,12 @@ conn_struct = namedtuple('conn_struct', [
     'server_seq',
     'client_seq',
     'expected_final_ack',
+<<<<<<< HEAD
     'last_activity'
+=======
+    'last_activity',
+    'window_size',
+>>>>>>> 064a9f7 (add flow-control)
 ])
 
 
@@ -416,7 +421,11 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
 
             # Unpack the received TCP header
             tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
+<<<<<<< HEAD
             src_port, dest_port, pkt_seq, pkt_ack, flags = (
+=======
+            src_port, dest_port, pkt_seq, pkt_ack, flags, first_pkt_window = (
+>>>>>>> 064a9f7 (add flow-control)
                 tcph[0],
                 tcph[1],
                 tcph[2],
@@ -453,7 +462,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_seq=2000,
                         client_seq=0,
                         expected_final_ack=0,
-                        last_activity=time.time()
+                        last_activity=time.time(),
+                        window_size=first_pkt_window,
                     )
                 session = connections[client_key]
 
@@ -497,6 +507,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         client_seq=pkt_seq,
                         expected_final_ack=server_seq + 1,
                         last_activity=time.time()
+                        window_size=first_pkt_window,
                     )
                     session = connections[client_key]
 
@@ -520,7 +531,11 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
 
                     # Unpack the received TCP header
                     tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
+<<<<<<< HEAD
                     src_port, dest_port, pkt_seq, pkt_ack, flags = (
+=======
+                    src_port, dest_port, pkt_seq, pkt_ack, flags, pkt_window = (
+>>>>>>> 064a9f7 (add flow-control)
                         tcph[0],
                         tcph[1],
                         tcph[2],
@@ -551,7 +566,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                                 server_seq=pkt_ack,
                                 client_seq=pkt_seq,
                                 expected_final_ack=session.expected_final_ack,
-                                last_activity=time.time()
+                                last_activity=time.time(),
+                                window_size=first_pkt_window,
                             )
                             session = connections[client_key]
 
@@ -593,7 +609,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_seq=pkt_ack,
                         client_seq=pkt_seq,
                         expected_final_ack=session.expected_final_ack,
-                        last_activity=time.time()
+                        last_activity=time.time(),
+                        window_size=first_pkt_window,
                     )
                     session = connections[client_key]
 
@@ -790,8 +807,24 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
             print(f"[Streap_raw] run_conn_send Connection not found for {client_ip}:{client_port}")
             return -1
         session = connections[client_key]
+<<<<<<< HEAD
+=======
+    offset = 0
+    payload_len = len(payload)
+    initial_seq = session.server_seq
+    target = initial_seq + payload_len
+    send_base = session.server_seq 
+    next_seq = session.server_seq
+    dup_ack_count = 0
+    cwnd = DEFAULT_TCP_WINDOW_BYTES  # Congestion window 
+    rwnd = conn_info.window_size  # Client Receive window 
+    packet_queue = get_packet_queue(client_key)
+
+    unacked_segments= {}
+>>>>>>> 064a9f7 (add flow-control)
     
     try:
+<<<<<<< HEAD
         bytes_sent = send_tcp_data_segment(
             s, listen_ip, client_ip, listen_port, client_port,
             seq=session.server_seq, ack_seq=session.client_seq, payload=payload
@@ -808,6 +841,179 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                 )
         
         return bytes_sent
+=======
+        while send_base < target:
+            with connections_lock:
+                if client_key not in connections:
+                    print(f"[Streap_raw] run_conn_send Connection lost for {client_ip}:{client_port}")
+                    return -1
+                curr_session = connections[client_key]
+                curr_client_seq = curr_session.server_seq
+                
+            while next_seq < target:
+                in_flight = next_seq - send_base
+                effective_window = min(cwnd, rwnd)
+                remaining_window = effective_window - in_flight
+                if remaining_window <= 0:
+                    break
+                chunk_size = min(remaining_window, payload_len - offset, MSS)
+                chunk = payload[offset:offset + chunk_size]
+                with connections_lock:
+                    local_rwnd = get_local_rwnd(recv_buffer=recv_buffers.setdefault, client_key=client_key)
+                bytes_sent = send_tcp_data_segment(
+                    s, listen_ip, client_ip, listen_port, client_port,
+                    seq=next_seq, ack_seq=curr_session.client_seq, payload=chunk, window = local_rwnd
+                )
+        
+                print(f"[Streap_raw] run_conn_send Sent {bytes_sent} bytes to {client_ip}:{client_port}")
+                offset += bytes_sent
+                unacked_segments[next_seq] = [chunk, time.time()]
+                next_seq += bytes_sent
+                
+                
+        
+                # Update sequence numbers
+                with connections_lock:
+                    if client_key in connections:
+                        connections[client_key] = curr_session._replace(
+                            server_seq=next_seq,
+                            last_activity=time.time()
+                        )
+            try:
+                packet, addr = packet_queue.get(timeout=1.0)
+
+                # Extract IP Header Length
+                ihl = (packet[0] & 0x0F) * 4
+                tcp_packet = packet[ihl:]
+                
+                if len(tcp_packet) < 20:
+                    continue
+
+                # Unpack the received TCP header
+                tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
+                src_port, dest_port, pkt_seq, pkt_ack, flags, pkt_window = (
+                    tcph[0],
+                    tcph[1],
+                    tcph[2],
+                    tcph[3],
+                    tcph[5],
+                    tcph[6]
+                )
+
+                # Bypass non-listen port
+                if dest_port != listen_port:
+                    continue
+
+                # Check if this packet is for our connection
+                if src_port != client_port:
+                    continue
+                
+                syn_flag = (flags & 0x02) >> 1
+                ack_flag = (flags & 0x10) >> 4
+                rst_flag = (flags & 0x04) >> 2
+
+                print(f"[Streap_raw] run_conn_recv: Received packet from {client_ip}:{client_port} (SYN={syn_flag}, ACK={ack_flag}, RST={rst_flag}, Seq={pkt_seq}, Ack={pkt_ack})")
+
+                with connections_lock:
+                    if client_key not in connections:
+                        continue
+                    session = connections[client_key]
+
+                # Handle RST (connection reset)
+                if rst_flag:
+                    print(f"[Streap_raw] Received RST from {client_ip}:{client_port}")
+                    with connections_lock:
+                        if client_key in connections:
+                            del connections[client_key]
+                    # Clean up packet queue
+                    remove_packet_queue(client_key)
+                    return -1
+
+                # Update last activity
+                with connections_lock:
+                    if client_key in connections:
+                        connections[client_key] = session._replace(last_activity=time.time())
+
+                # Handle data payload (PSH + ACK) or (ACK with data) - Fast path ACK
+                # Some clients may not set PSH flag for small requests
+                has_data = len(tcp_packet) > ((tcp_packet[12] >> 4) & 0x0F) * 4
+                if ack_flag and has_data and not syn_flag and not rst_flag:
+                    # # Dynamically look up header length to bypass any incoming TCP Options
+                    # tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
+                    # app_payload = tcp_packet[tcp_header_len:]
+                    
+                    # if len(app_payload) > 0:
+                    #     print(f"[Streap_raw] Received {len(app_payload)} bytes of data from {client_ip}:{client_port}")
+                    #     print(f"[Streap_raw] Received payload: {app_payload[:100]}...")
+                        
+                    #     # Send ACK for received data IMMEDIATELY (fast path)
+                    #     next_ack = pkt_seq + len(app_payload)
+                        
+                    #     ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
+                    #                                 seq=session.server_seq, ack_seq=next_ack, ack=1)
+                    #     ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
+                    #     s.sendto(ip_header + ack_packet, (client_ip, 0))
+                    #     print(f"[Streap_raw] Sent ACK for data (Ack={next_ack})")
+                        
+                    #     # Update sequence numbers AFTER ACK sent
+                    #     with connections_lock:
+                    #         if client_key in connections:
+                    #             connections[client_key] = session._replace(
+                    #                 server_seq=session.server_seq,
+                    #                 client_seq=next_ack,
+                    #                 last_activity=time.time()
+                    #             )
+                            
+                    #     # Return the received payload
+                    #     return app_payload
+                    if pkt_ack > send_base or (pkt_ack == send_base and pkt_window >= rwnd):
+                        rwnd = pkt_window 
+                        if (pkt_ack > send_base):
+                            send_base = pkt_ack
+                            dup_ack_count = 0
+                        for acked_seq in list(unacked_segments.keys()):
+                            if acked_seq <= pkt_ack:
+                                del unacked_segments[acked_seq]
+                    packet_queue.put((packet, addr))  # Put back the packet for run_conn_recv to handle
+                    continue
+
+                # Handle pure ACK (no data)
+                if ack_flag and not syn_flag and not has_data:
+                    print(f"[Streap_raw] Received ACK from {client_ip}:{client_port} (Ack={pkt_ack})")
+                    
+                    if pkt_ack > send_base:
+                        rwnd = pkt_window 
+                        send_base = pkt_ack
+                        dup_ack_count = 0
+                        for acked_seq in list(unacked_segments.keys()):
+                            if acked_seq <= pkt_ack:
+                                del unacked_segments[acked_seq]
+                    
+                    elif pkt_ack == send_base:
+                          if pkt_window >= rwnd:
+                              rwnd = pkt_window
+                          dup_ack_count += 1
+                          if dup_ack_count == 3 and send_base in unacked_segments:
+                              #Retransmit
+                              seg = unacked_segments[send_base]
+                              send_tcp_data_segment(
+                                  s, listen_ip, client_ip, listen_port, client_port,
+                                  seq=send_base, ack_seq=session.client_seq, payload=seg[0], window = rwnd
+                              )
+                              seg[1] = time.time()
+                              
+                    # with connections_lock:
+                    #     if client_key in connections:
+                    #         connections[client_key] = session._replace(
+                    #             server_seq=pkt_ack,
+                    #             last_activity=time.time()
+                    #         )
+            except queue.Empty:
+                pass
+                
+        
+        return payload_len
+>>>>>>> 064a9f7 (add flow-control)
         
     except Exception as e:
         print(f"[Streap_raw] run_conn_send Error in run_conn_send: {e}")
@@ -841,3 +1047,33 @@ def close_all_connections():
     """Close all connections and clean up."""
     with connections_lock:
         connections.clear()
+<<<<<<< HEAD
+=======
+
+# Feature: Implement TCP flow control and window management
+def get_local_rwnd(recv_buffer, client_key) -> int:
+    """Remaining free space in the local receive buffer."""
+    recv_buffer.setdefault(client_key, {'in_order': bytearray(), 'out_of_order': {}})
+    out_of_order_bytes = sum(len(chunk) for chunk in recv_buffer[client_key]['out_of_order'].values())
+    used_bytes = len(recv_buffer[client_key]['in_order']) + out_of_order_bytes
+    free_bytes = MAX_RECV_BUFFER_BYTES - used_bytes
+    local_rwnd = max(0, free_bytes)
+    return min(local_rwnd, DEFAULT_TCP_WINDOW_BYTES)
+
+def get_flight_size_bytes(self) -> int:
+    """Total unacknowledged bytes currently in flight."""
+    with self.lock:
+        return (self.next_send_seq - self.oldest_unacked_seq) & SEQ_NUMBER_MODULO
+
+def get_effective_window_bytes(self) -> int:
+    """Effective send window capped by cwnd and peer rwnd."""
+    with self.lock:
+        return min(int(self.cwnd_bytes), self.peer_rwnd)
+
+def get_available_send_bytes(self) -> int:
+    """Bytes we can transmit right now without exceeding the window."""
+    with self.lock:
+        effective_window = min(int(self.cwnd_bytes), self.peer_rwnd)
+        in_flight = (self.next_send_seq - self.oldest_unacked_seq) & SEQ_NUMBER_MODULO
+        return max(0, effective_window - in_flight)
+>>>>>>> 064a9f7 (add flow-control)
