@@ -31,17 +31,30 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-MSS = 1400       # Leave room for IP/TCP headers within 1500B MTU
+MSS = 1460       # Leave room for IP/TCP headers within 1500B MTU
 MAX_RECV_BUFFER_BYTES = 65535
 DEFAULT_TCP_WINDOW_BYTES = 65535    # Max 16-bit TCP window size
 SEQ_NUMBER_MASK = 0xFFFFFFFF      # 32-bit sequence wrap mask
 
 INITIAL_CWND_SEGMENTS = 2
 INITIAL_RTO_SEC = 1.0
-MIN_RTO_SEC = 0.2
+MIN_RTO_SEC = 1.0
 MAX_RTO_SEC = 60.0
 RTT_EWMA_ALPHA = 0.125              # SRTT smoothing factor
 RTT_EWMA_BETA = 0.25                # RTTVAR smoothing factor
+
+DEFAULT_CLOCK_GRANULARITY_G = 0.1
+PROBE_K_FACTOR = 4.0
+
+def calculate_pto(
+        rtt: float,
+        g: float = DEFAULT_CLOCK_GRANULARITY_G,
+        k: float = PROBE_K_FACTOR,
+        min_pto: float = MIN_RTO_SEC,
+        max_pto: float = MAX_RTO_SEC,
+) -> float:
+    calculated_pto = rtt + max(g, k * (rtt/2.0))
+    return max(min_pto, min(calculated_pto, max_pto))
 
 # Import streaprout packet dispatcher functions
 from .streaprous_packet_dispatcher import (
@@ -520,8 +533,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_seq=server_seq,
                         client_seq=pkt_seq, 
                         expected_final_ack=server_seq + 1,
-                        last_activity=time.time()
-                        window_size=first_pkt_window,
+                        last_activity=time.time(),
+                        window_size=first_pkt_window
                     )
                     session = connections[client_key]
 
@@ -848,13 +861,29 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
     send_base = session.server_seq 
     next_seq = session.server_seq
     dup_ack_count = 0
-    cwnd = DEFAULT_TCP_WINDOW_BYTES  # Congestion window 
+    cwnd = float(INITIAL_CWND_SEGMENTS * MSS) # featue 3
+    MSS = 1460
     rwnd = conn_info.window_size  # Client Receive window 
     packet_queue = get_packet_queue(client_key)
 
     unacked_segments= {}
-    
-    MSS = 1460
+
+# ==== feature 2: probe timer ====
+    probe_timer_armed = False
+    probe_pto = INITIAL_RTO_SEC
+    next_probe_deadline = 0.0
+    probe_count = 0
+# =======
+# ==== feature 3 ==== 
+    ssthresh = DEFAULT_TCP_WINDOW_BYTES
+    cc_state = CongestionState.SLOW_START
+    w_max = 0.0
+    epoch_start = None
+    cubic_k = 0.0
+    estimated_rtt = 0.1
+    dev_rtt = 0.05
+    timeout_interval = INITIAL_RTO_SEC
+# =======
     try:
         while send_base < target:
             with connections_lock:
@@ -866,7 +895,8 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                 
             while next_seq < target:
                 in_flight = next_seq - send_base
-                effective_window = min(cwnd, rwnd)
+                #feature 3 (sửa) cai cwnd phải ép về int để thỏa cái chunk_size phải là int
+                effective_window = min(int(cwnd), rwnd)
                 remaining_window = effective_window - in_flight
                 if remaining_window <= 0:
                     break
@@ -881,7 +911,8 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
         
                 print(f"[Streap_raw] run_conn_send Sent {bytes_sent} bytes to {client_ip}:{client_port}")
                 offset += bytes_sent
-                unacked_segments[next_seq] = [chunk, time.time()]
+                #feature 3 (sửa)
+                unacked_segments[next_seq] = [chunk, time.time(), False]
                 next_seq += bytes_sent
                 
                 
@@ -893,8 +924,28 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                             server_seq=next_seq,
                             last_activity=time.time()
                         )
+
+            #feature 2: arm probe timer when blocked
+            #check if sender is blocked due to rwnd = 0 or expected_window = 0
+            effective_window = min(int(cwnd), rwnd)
+            if (rwnd == 0 or effective_window == 0) and send_base < target:
+                if not probe_timer_armed:
+                    probe_timer_armed = True
+                    rtt_sample = estimated_rtt if (estimated_rtt is not None and estimated_rtt > 0) else INITIAL_RTO_SEC
+                    probe_pto = calculate_pto(rtt=rtt_sample)
+                    next_probe_deadline = time.time() + probe_pto
+                    probe_count = 0
+                    print(f"[Streap_raw] run_conn_send: Sender blocked, arming probe timer (PTO={probe_pto:.3f}s)")
+
+            #wake up on time for probe deadline so it dont oversleep and miss the deadline
+            if probe_timer_armed:
+                time_to_deadline = max(0.005, next_probe_deadline - time.time())
+                current_timeout = min(timeout_interval, time_to_deadline)
+            else:
+                current_timeout = timeout_interval
             try:
-                packet, addr = packet_queue.get(timeout=1.0)
+                #feature 3 (sửa)
+                packet, addr = packet_queue.get(timeout=current_timeout)
 
                 # Extract IP Header Length
                 ihl = (packet[0] & 0x0F) * 4
@@ -981,12 +1032,42 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                     #     # Return the received payload
                     #     return app_payload
                     if pkt_ack > send_base or (pkt_ack == send_base and pkt_window >= rwnd):
-                        rwnd = pkt_window 
+                        rwnd = pkt_window
+                        if rwnd > 0 and probe_timer_armed:
+                            probe_timer_armed = False
+                            print(f"[Streap_raw] run_conn_send: Received ACK with rwnd > 0, disarming probe timer")
                         if (pkt_ack > send_base):
+                            # ==== feature 3 (thêm) ==========
+                            now = time.time()
+                            acked_bytes = pkt_ack - send_base
+                            if send_base in unacked_segments and not unacked_segments[send_base][2]:
+                                sample_rtt = max(0.001, now - unacked_segments[send_base][1])
+                                dev_rtt = (1 - RTT_EWMA_BETA) * dev_rtt + RTT_EWMA_BETA * abs(sample_rtt - estimated_rtt)
+                                estimated_rtt = (1 - RTT_EWMA_ALPHA) * estimated_rtt + RTT_EWMA_ALPHA * sample_rtt
+                                timeout_interval = max(MIN_RTO_SEC, min(MAX_RTO_SEC, estimated_rtt + 4 * dev_rtt))
+                            # ===========
                             send_base = pkt_ack
                             dup_ack_count = 0
+                            # ======= Feature 3 (thêm) ==========
+                            if cc_state == CongestionState.FAST_RECOVERY:
+                                cwnd = float(ssthresh)
+                                epoch_start = None
+                                cc_state = CongestionState.CONGESTION_AVOIDANCE
+                            elif cc_state == CongestionState.SLOW_START:
+                                cwnd += float(acked_bytes)
+                                if cwnd >= ssthresh:
+                                    cc_state = CongestionState.CONGESTION_AVOIDANCE
+                                    epoch_start = None
+                            elif cc_state == CongestionState.CONGESTION_AVOIDANCE:
+                                target_cwnd, epoch_start, cubic_k = compute_cubic_target(
+                                    cwnd, w_max, epoch_start, cubic_k, now, MSS
+                                )
+                                if target_cwnd > cwnd:
+                                    cwnd += ((target_cwnd - cwnd) / cwnd) * acked_bytes
+                            # ==========
                         for acked_seq in list(unacked_segments.keys()):
-                            if acked_seq <= pkt_ack:
+                            #feature 3 (sửa lại)
+                            if acked_seq + len(unacked_segments[acked_seq][0]) <= pkt_ack:
                                 del unacked_segments[acked_seq]
                     packet_queue.put((packet, addr))  # Put back the packet for run_conn_recv to handle
                     continue
@@ -996,25 +1077,70 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                     print(f"[Streap_raw] Received ACK from {client_ip}:{client_port} (Ack={pkt_ack})")
                     
                     if pkt_ack > send_base:
-                        rwnd = pkt_window 
+                        rwnd = pkt_window
+                        if rwnd > 0 and probe_timer_armed:
+                            probe_timer_armed = False
+                            print(f"[Streap_raw] run_conn_send: Received ACK with rwnd > 0, disarming probe timer")
+                        # ========== Feature 3 (thêm) ==========
+                        now = time.time()
+                        acked_bytes = pkt_ack - send_base
+                        if send_base in unacked_segments and not unacked_segments[send_base][2]:
+                            sample_rtt = max(0.001, now - unacked_segments[send_base][1])
+                            dev_rtt = (1 - RTT_EWMA_BETA) * dev_rtt + RTT_EWMA_BETA * abs(sample_rtt - estimated_rtt)
+                            estimated_rtt = (1 - RTT_EWMA_ALPHA) * estimated_rtt + RTT_EWMA_ALPHA * sample_rtt
+                            timeout_interval = max(MIN_RTO_SEC, min(MAX_RTO_SEC, estimated_rtt + 4 * dev_rtt))
+                        # ====================
                         send_base = pkt_ack
                         dup_ack_count = 0
                         for acked_seq in list(unacked_segments.keys()):
-                            if acked_seq <= pkt_ack:
+                            #=========feature 3 (sửa)
+                            if acked_seq + len(unacked_segments[acked_seq][0]) <= pkt_ack:
                                 del unacked_segments[acked_seq]
+                        # ========== Feature 3 ============
+                        if cc_state == CongestionState.FAST_RECOVERY:
+                            cwnd = float(ssthresh)
+                            epoch_start = None
+                            cc_state = CongestionState.CONGESTION_AVOIDANCE
+                        elif cc_state == CongestionState.SLOW_START:
+                            cwnd += float(acked_bytes)
+                            if cwnd >= ssthresh:
+                                cc_state = CongestionState.CONGESTION_AVOIDANCE
+                                epoch_start = None
+                        elif cc_state == CongestionState.CONGESTION_AVOIDANCE:
+                            target_cwnd, epoch_start, cubic_k = compute_cubic_target(
+                                cwnd, w_max, epoch_start, cubic_k, now, MSS
+                            )
+                            if target_cwnd > cwnd:
+                                cwnd += ((target_cwnd - cwnd) / cwnd) * acked_bytes
+                        # =============================
                     
                     elif pkt_ack == send_base:
-                          if pkt_window >= rwnd:
-                              rwnd = pkt_window
-                          dup_ack_count += 1
-                          if dup_ack_count == 3 and send_base in unacked_segments:
-                              #Retransmit
-                              seg = unacked_segments[send_base]
-                              send_tcp_data_segment(
-                                  s, listen_ip, client_ip, listen_port, client_port,
-                                  seq=send_base, ack_seq=session.client_seq, payload=seg[0], window = rwnd
-                              )
-                              seg[1] = time.time()
+                        rwnd = pkt_window
+                        if rwnd > 0 and probe_timer_armed:
+                            probe_timer_armed = False
+                            print(f"[Streap_raw] run_conn_send: Received ACK with rwnd > 0, disarming probe timer")
+                        dup_ack_count += 1
+                        if dup_ack_count == 3 and send_base in unacked_segments:
+                              # =========== Feature 3 ============
+                            w_max = cwnd
+                            ssthresh = max(int(cwnd * CUBIC_BETA), 2 * MSS)
+                            cwnd = float(ssthresh + 3 * MSS)
+                            epoch_start = None
+                            cc_state = CongestionState.FAST_RECOVERY
+                            # ============================
+                            #Retransmit
+                            seg = unacked_segments[send_base]
+                            send_tcp_data_segment(
+                                s, listen_ip, client_ip, listen_port, client_port,
+                                seq=send_base, ack_seq=session.client_seq, payload=seg[0], window = rwnd
+                            )
+                            seg[1] = time.time()
+                            #feature 3(thêm cho cái cờ)
+                            seg[2] = True
+                            # ================ Feature 3 ================
+                        elif dup_ack_count > 3 and cc_state == CongestionState.FAST_RECOVERY:
+                            cwnd += float(MSS)
+                          # ====================
                               
                     # with connections_lock:
                     #     if client_key in connections:
@@ -1023,9 +1149,42 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                     #             last_activity=time.time()
                     #         )
             except queue.Empty:
-                pass
-                
-        
+                # ==================== Feature 3 ====================
+                if send_base < target and send_base in unacked_segments:
+                    w_max = cwnd
+                    ssthresh = max(int(cwnd * CUBIC_BETA), 2 * MSS)
+                    cwnd = float(MSS)
+                    dup_ack_count = 0
+                    epoch_start = None
+                    cc_state = CongestionState.SLOW_START
+
+                    seg = unacked_segments[send_base]
+                    send_tcp_data_segment(
+                        s, listen_ip, client_ip, listen_port, client_port,
+                        seq=send_base, ack_seq=curr_session.client_seq, payload=seg[0], window=rwnd
+                    )
+                    seg[1] = time.time()
+                    seg[2] = True
+                # ===================================================
+            # ====== feature 2: zero-window probe ======
+            if probe_timer_armed and time.time() >= next_probe_deadline:
+                probe_count += 1
+                probe_payload = payload[offset:offset + 1] if offset < payload_len else b"\x00"
+                probe_seq = send_base
+                print (f"[Streap_raw] run_conn_send: Probe timer expired, sending zero-window probe packet (count={probe_count}, seq={probe_seq}, PTO={probe_pto:.3f}s)")
+                with connections_lock:
+                    local_rwnd = get_local_rwnd(recv_buffer=recv_buffers, client_key=client_key)
+                send_tcp_data_segment(
+                    s, listen_ip, client_ip, listen_port, client_port,
+                    seq=probe_seq, ack_seq=curr_session.client_seq, payload=probe_payload, window = local_rwnd
+                )
+
+                # double PTO for next attempt (capped at MAX_RTO_SEC = 60s)
+                probe_pto = min(probe_pto * 2.0, MAX_RTO_SEC)
+                next_probe_deadline = time.time() + probe_pto
+                print(f"[Streap_raw] run_conn_send: Next probe deadline in (PTO={probe_pto:.3f}s)")
+
+
         return payload_len
         
     except Exception as e:
@@ -1087,3 +1246,39 @@ def get_available_send_bytes(self) -> int:
         effective_window = min(int(self.cwnd_bytes), self.peer_rwnd)
         in_flight = (self.next_send_seq - self.oldest_unacked_seq) & SEQ_NUMBER_MODULO
         return max(0, effective_window - in_flight)
+
+# Feature 3 helper function cho phase 2 va tham do
+CUBIC_C = 0.4      
+CUBIC_BETA = 0.7 
+
+def compute_cubic_target(
+    cwnd: float,
+    w_max: float,
+    epoch_start,
+    cubic_k: float,
+    now: float,
+    mss: int,
+):
+    mss_f = float(mss)
+
+#dieu kien check coi cai nay la ack1 hay ack2,3,4,...
+    if epoch_start is None:
+        epoch_start = now
+        # dieu kien cua phase 2
+        if cwnd < w_max:
+            cubic_k = (max(0.0, (w_max - cwnd) / mss_f) /CUBIC_C ) ** (1.0 / 3.0)
+            total_bytes = w_max
+        # khi tham do
+        else:
+            cubic_k = 0.0
+            total_bytes = cwnd
+#dieu kien cua ack2,3,4
+    else:
+        total_bytes = w_max if w_max > 0.0 else  cwnd
+
+
+    t = max(0.0, now - epoch_start)
+    w_cubic_seg = CUBIC_C*((t -cubic_k) ** 3) + (total_bytes / mss_f)
+    w_cubic_bytes = w_cubic_seg * mss_f
+
+    return w_cubic_bytes, epoch_start, cubic_k
