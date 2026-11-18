@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-MSS = 1400       # Leave room for IP/TCP headers within 1500B MTU
+MSS = 1460       # Leave room for IP/TCP headers within 1500B MTU
 MAX_RECV_BUFFER_BYTES = 65535
 DEFAULT_TCP_WINDOW_BYTES = 65535    # Max 16-bit TCP window size
 SEQ_NUMBER_MASK = 0xFFFFFFFF      # 32-bit sequence wrap mask
@@ -520,8 +520,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_seq=server_seq,
                         client_seq=pkt_seq, 
                         expected_final_ack=server_seq + 1,
-                        last_activity=time.time()
-                        window_size=first_pkt_window,
+                        last_activity=time.time(),
+                        window_size=first_pkt_window
                     )
                     session = connections[client_key]
 
