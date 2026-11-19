@@ -26,6 +26,8 @@ import threading
 import time
 import queue
 from collections import namedtuple, OrderedDict
+from random import Random, randint
+
 import netifaces
 from dataclasses import dataclass
 from enum import Enum
@@ -36,12 +38,15 @@ MAX_RECV_BUFFER_BYTES = 65535
 DEFAULT_TCP_WINDOW_BYTES = 65535    # Max 16-bit TCP window size
 SEQ_NUMBER_MASK = 0xFFFFFFFF      # 32-bit sequence wrap mask
 
-INITIAL_CWND_SEGMENTS = 2
 INITIAL_RTO_SEC = 1.0
 MIN_RTO_SEC = 1.0
 MAX_RTO_SEC = 60.0
-RTT_EWMA_ALPHA = 0.125              # SRTT smoothing factor
-RTT_EWMA_BETA = 0.25                # RTTVAR smoothing factor
+RTT_EWMA_ALPHA = 0.125              # estimated_rtt smoothing factor
+RTT_EWMA_BETA = 0.25                # dev_rtt smoothing factor
+
+INITIAL_CWND_SEGMENTS = 2
+CUBIC_C = 0.4      
+CUBIC_BETA = 0.7 
 
 DEFAULT_CLOCK_GRANULARITY_G = 0.1
 PROBE_K_FACTOR = 4.0
@@ -86,6 +91,7 @@ conn_struct = namedtuple('conn_struct', [
     'expected_final_ack',
     'last_activity',
     'window_size',
+    'wscale',
 ])
 
 
@@ -427,7 +433,6 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
     else:
         send_ip = listen_ip
     
-    server_seq = 2000
     client_ip = None
     client_port = None
 
@@ -486,11 +491,12 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_ip=send_ip,
                         server_port=listen_port,
                         state="LISTEN",
-                        server_seq=2000,
+                        server_seq=server_seq,
                         client_seq=0,
                         expected_final_ack=0,
                         last_activity=time.time(),
                         window_size=first_pkt_window,
+                        wscale=1,
                     )
                 session = connections[client_key]
 
@@ -500,6 +506,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
             if syn_flag == 1 and ack_flag == 0:
                 print(f"\nHandshake1: Received SYN from Client ({client_ip}:{client_port}) (Seq={pkt_seq})")
 
+                server_seq = randint(0, SEQ_NUMBER_MASK)
+                client_ws = parse_tcp_window_scale(tcp_packet)
                 # Quick duplicate handshake check (fast, no heavy operations)
                 with handshake_lock:
                     if handshake_in_progress.get(client_key, False):
@@ -591,7 +599,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                                 client_seq=pkt_seq,
                                 expected_final_ack=session.expected_final_ack,
                                 last_activity=time.time(),
-                                window_size=first_pkt_window,
+                                window_size=pkt_window * session.wscale,
+                                wscale=session.wscale
                             )
                             session = connections[client_key]
 
@@ -634,7 +643,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         client_seq=pkt_seq,
                         expected_final_ack=session.expected_final_ack,
                         last_activity=time.time(),
-                        window_size=first_pkt_window,
+                        window_size=first_pkt_window * session.wscale,
+                        wscale=client_ws
                     )
                     session = connections[client_key]
 
@@ -857,12 +867,12 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
     offset = 0
     payload_len = len(payload)
     initial_seq = session.server_seq
-    target = initial_seq + payload_len
+    target = initial_seq + payload_len 
     send_base = session.server_seq 
     next_seq = session.server_seq
     dup_ack_count = 0
     cwnd = float(INITIAL_CWND_SEGMENTS * MSS) # featue 3
-    MSS = 1460
+   
     rwnd = conn_info.window_size  # Client Receive window 
     packet_queue = get_packet_queue(client_key)
 
@@ -883,6 +893,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
     estimated_rtt = None
     dev_rtt = None
     timeout_interval = INITIAL_RTO_SEC
+    timeout_retries = 0
 # =======
     try:
         while send_base < target:
@@ -891,7 +902,6 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                     print(f"[Streap_raw] run_conn_send Connection lost for {client_ip}:{client_port}")
                     return -1
                 curr_session = connections[client_key]
-                curr_client_seq = curr_session.server_seq
                 
             while next_seq < target:
                 in_flight = next_seq - send_base
@@ -903,7 +913,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                 chunk_size = min(remaining_window, payload_len - offset, MSS)
                 chunk = payload[offset:offset + chunk_size]
                 with connections_lock:
-                    local_rwnd = get_local_rwnd(recv_buffer=recv_buffers.setdefault, client_key=client_key)
+                    local_rwnd = get_local_rwnd(recv_buffer=recv_buffers, client_key=client_key)
                 bytes_sent = send_tcp_data_segment(
                     s, listen_ip, client_ip, listen_port, client_port,
                     seq=next_seq, ack_seq=curr_session.client_seq, payload=chunk, window = local_rwnd
@@ -924,6 +934,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                             server_seq=next_seq,
                             last_activity=time.time()
                         )
+            processed_packets = []
 
             #feature 2: arm probe timer when blocked
             #check if sender is blocked due to rwnd = 0 or expected_window = 0
@@ -945,7 +956,12 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
             try:
                 #feature 3 (sửa)
                 packet, addr = packet_queue.get(timeout=current_timeout)
-
+                processed_packets.append((packet, addr))
+                while True:
+                    processed_packets.append(packet_queue.get_nowait())
+            except queue.Empty:
+                pass
+            for packet, addr in processed_packets: 
                 # Extract IP Header Length
                 ihl = (packet[0] & 0x0F) * 4
                 tcp_packet = packet[ihl:]
@@ -974,8 +990,9 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                 
                 syn_flag = (flags & 0x02) >> 1
                 ack_flag = (flags & 0x10) >> 4
+                psh_flag = (flags & 0x08) >> 3
+                fin_flag = (flags & 0x01)
                 rst_flag = (flags & 0x04) >> 2
-
                 print(f"[Streap_raw] run_conn_recv: Received packet from {client_ip}:{client_port} (SYN={syn_flag}, ACK={ack_flag}, RST={rst_flag}, Seq={pkt_seq}, Ack={pkt_ack})")
 
                 with connections_lock:
@@ -983,7 +1000,24 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                         continue
                     session = connections[client_key]
 
+                
                 # Handle RST (connection reset)
+                if fin_flag: 
+                    print(f"[Streap_raw] Received FIN from {client_ip}:{client_port}")
+                    # Send ACK for FIN
+                    ack_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
+                                                seq=session.server_seq, ack_seq=pkt_seq + 1, ack=1)
+                    ip_header = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
+                    s.sendto(ip_header + ack_packet, (client_ip, 0))
+                                    
+                    with connections_lock:
+                        if client_key in connections:
+                            del connections[client_key]
+                            del recv_buffers[client_key]
+                        # Clean up packet queue
+                        remove_packet_queue(client_key)
+                        return -1
+
                 if rst_flag:
                     print(f"[Streap_raw] Received RST from {client_ip}:{client_port}")
                     with connections_lock:
@@ -1001,7 +1035,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                 # Handle data payload (PSH + ACK) or (ACK with data) - Fast path ACK
                 # Some clients may not set PSH flag for small requests
                 has_data = len(tcp_packet) > ((tcp_packet[12] >> 4) & 0x0F) * 4
-                if ack_flag and has_data and not syn_flag and not rst_flag:
+                if (psh_flag and ack_flag) or (ack_flag and has_data and not syn_flag and not fin_flag and not rst_flag):
                     # # Dynamically look up header length to bypass any incoming TCP Options
                     # tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
                     # app_payload = tcp_packet[tcp_header_len:]
@@ -1041,10 +1075,8 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                             acked_bytes = pkt_ack - send_base
                             if send_base in unacked_segments and not unacked_segments[send_base][2]:
                                 sample_rtt = max(0.001, now - unacked_segments[send_base][1])
-                                dev_rtt = (1 - RTT_EWMA_BETA) * dev_rtt + RTT_EWMA_BETA * abs(sample_rtt - estimated_rtt)
-                                estimated_rtt = (1 - RTT_EWMA_ALPHA) * estimated_rtt + RTT_EWMA_ALPHA * sample_rtt
-                                timeout_interval = max(MIN_RTO_SEC, min(MAX_RTO_SEC, estimated_rtt + 4 * dev_rtt))
-                            # ===========
+                                estimated_rtt, dev_rtt, timeout_interval = update_rto(estimated_rtt, dev_rtt, sample_rtt)
+                            
                             send_base = pkt_ack
                             dup_ack_count = 0
                             # ======= Feature 3 (thêm) ==========
@@ -1085,9 +1117,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                         acked_bytes = pkt_ack - send_base
                         if send_base in unacked_segments and not unacked_segments[send_base][2]:
                             sample_rtt = max(0.001, now - unacked_segments[send_base][1])
-                            dev_rtt = (1 - RTT_EWMA_BETA) * dev_rtt + RTT_EWMA_BETA * abs(sample_rtt - estimated_rtt)
-                            estimated_rtt = (1 - RTT_EWMA_ALPHA) * estimated_rtt + RTT_EWMA_ALPHA * sample_rtt
-                            timeout_interval = max(MIN_RTO_SEC, min(MAX_RTO_SEC, estimated_rtt + 4 * dev_rtt))
+                            estimated_rtt, dev_rtt, timeout_interval = update_rto(estimated_rtt, dev_rtt, sample_rtt)
                         # ====================
                         send_base = pkt_ack
                         dup_ack_count = 0
@@ -1147,24 +1177,32 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                     #             server_seq=pkt_ack,
                     #             last_activity=time.time()
                     #         )
-            except queue.Empty:
-                # ==================== Feature 3 ====================
-                if send_base < target and send_base in unacked_segments:
+                
+            
+            if send_base in unacked_segments:
+                oldest_seg = unacked_segments[send_base]
+                if time.time() - oldest_seg[1] >= timeout_interval:  
+                    # Retransmit
+                    timeout_retries += 1
+                    if timeout_retries > 5:
+                        return -1
+                    
                     w_max = cwnd
                     ssthresh = max(int(cwnd * CUBIC_BETA), 2 * MSS)
                     cwnd = float(MSS)
-                    dup_ack_count = 0
                     epoch_start = None
                     cc_state = CongestionState.SLOW_START
+                    dup_ack_count = 0
 
-                    seg = unacked_segments[send_base]
+                    oldest_seg[2] = True
                     send_tcp_data_segment(
                         s, listen_ip, client_ip, listen_port, client_port,
-                        seq=send_base, ack_seq=curr_session.client_seq, payload=seg[0], window=rwnd
+                        seq=send_base, ack_seq=session.client_seq, payload=oldest_seg[0], window = rwnd
                     )
-                    seg[1] = time.time()
-                    seg[2] = True
-                # ===================================================
+                    oldest_seg[1] = time.time()
+                    timeout_interval = min(timeout_interval * 2, MAX_RTO_SEC)
+                    print(f"[Streap_raw] run_conn_send: Retransmitted segment at Seq={send_base} due to timeout")
+    except queue.Empty:
             # ====== feature 2: zero-window probe ======
             if probe_timer_armed and time.time() >= next_probe_deadline:
                 probe_count += 1
@@ -1218,8 +1256,8 @@ def close_all_connections():
     """Close all connections and clean up."""
     with connections_lock:
         connections.clear()
+        
 
-# Feature: Implement TCP flow control and window management
 def get_local_rwnd(recv_buffer, client_key) -> int:
     """Remaining free space in the local receive buffer."""
     recv_buffer.setdefault(client_key, {'in_order': bytearray(), 'out_of_order': {}})
@@ -1229,27 +1267,18 @@ def get_local_rwnd(recv_buffer, client_key) -> int:
     local_rwnd = max(0, free_bytes)
     return min(local_rwnd, DEFAULT_TCP_WINDOW_BYTES)
 
-def get_flight_size_bytes(self) -> int:
-    """Total unacknowledged bytes currently in flight."""
-    with self.lock:
-        return (self.next_send_seq - self.oldest_unacked_seq) & SEQ_NUMBER_MODULO
-
-def get_effective_window_bytes(self) -> int:
-    """Effective send window capped by cwnd and peer rwnd."""
-    with self.lock:
-        return min(int(self.cwnd_bytes), self.peer_rwnd)
-
-def get_available_send_bytes(self) -> int:
-    """Bytes we can transmit right now without exceeding the window."""
-    with self.lock:
-        effective_window = min(int(self.cwnd_bytes), self.peer_rwnd)
-        in_flight = (self.next_send_seq - self.oldest_unacked_seq) & SEQ_NUMBER_MODULO
-        return max(0, effective_window - in_flight)
-
+def update_rto(estimated_rtt, dev_rtt, sample_rtt):
+    if estimated_rtt is None:
+        estimated_rtt = sample_rtt
+        dev_rtt = sample_rtt / 2.0
+    else:
+        dev_rtt = (1.0 - RTT_EWMA_BETA) * dev_rtt + RTT_EWMA_BETA * abs(estimated_rtt - sample_rtt)
+        estimated_rtt = (1.0 - RTT_EWMA_ALPHA) * estimated_rtt + RTT_EWMA_ALPHA * sample_rtt
+    timeout_interval = min(MAX_RTO_SEC, estimated_rtt + 4.0 * dev_rtt)
+    timeout_interval = max(MIN_RTO_SEC, timeout_interval)
+    return estimated_rtt, dev_rtt, timeout_interval
+  
 # Feature 3 helper function cho phase 2 va tham do
-CUBIC_C = 0.4      
-CUBIC_BETA = 0.7 
-
 def compute_cubic_target(
     cwnd: float,
     w_max: float,
@@ -1271,6 +1300,7 @@ def compute_cubic_target(
         else:
             cubic_k = 0.0
             total_bytes = cwnd
+            
 #dieu kien cua ack2,3,4
     else:
         total_bytes = w_max if w_max > 0.0 else  cwnd
