@@ -26,6 +26,8 @@ import threading
 import time
 import queue
 from collections import namedtuple, OrderedDict
+from random import Random, randint
+
 import netifaces
 from dataclasses import dataclass
 from enum import Enum
@@ -42,6 +44,7 @@ MAX_RTO_SEC = 60.0
 RTT_ALPHA = 0.125              # SRTT smoothing factor
 RTT_BETA = 0.25                # RTTVAR smoothing factor
 
+INITIAL_CWND_SEGMENTS = 2
 CUBIC_C = 0.4      
 CUBIC_BETA = 0.7 
 
@@ -75,6 +78,7 @@ conn_struct = namedtuple('conn_struct', [
     'expected_final_ack',
     'last_activity',
     'window_size',
+    'wscale',
 ])
 
 
@@ -416,7 +420,6 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
     else:
         send_ip = listen_ip
     
-    server_seq = 2000
     client_ip = None
     client_port = None
 
@@ -440,7 +443,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
 
             # Unpack the received TCP header
             tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-            src_port, dest_port, pkt_seq, pkt_ack, flags, pkt_window = (
+            src_port, dest_port, pkt_seq, pkt_ack, flags, first_pkt_window = (
                 tcph[0],
                 tcph[1],
                 tcph[2],
@@ -475,11 +478,12 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_ip=send_ip,
                         server_port=listen_port,
                         state="LISTEN",
-                        server_seq=2000,
+                        server_seq=server_seq,
                         client_seq=0,
                         expected_final_ack=0,
                         last_activity=time.time(),
                         window_size=first_pkt_window,
+                        wscale=1,
                     )
                 session = connections[client_key]
 
@@ -489,6 +493,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
             if syn_flag == 1 and ack_flag == 0:
                 print(f"\nHandshake1: Received SYN from Client ({client_ip}:{client_port}) (Seq={pkt_seq})")
 
+                server_seq = randint(0, SEQ_NUMBER_MASK)
+                client_ws = parse_tcp_window_scale(tcp_packet)
                 # Quick duplicate handshake check (fast, no heavy operations)
                 with handshake_lock:
                     if handshake_in_progress.get(client_key, False):
@@ -523,7 +529,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         client_seq=pkt_seq, 
                         expected_final_ack=server_seq + 1,
                         last_activity=time.time(),
-                        window_size=first_pkt_window
+                        window_size=first_pkt_window,
+                        wscale=client_ws
                     )
                     session = connections[client_key]
 
@@ -547,7 +554,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
 
                     # Unpack the received TCP header
                     tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-                    src_port, dest_port, pkt_seq, pkt_ack, flags, window = (
+                    src_port, dest_port, pkt_seq, pkt_ack, flags, pkt_window = (
                         tcph[0],
                         tcph[1],
                         tcph[2],
@@ -580,7 +587,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                                 client_seq=pkt_seq,
                                 expected_final_ack=session.expected_final_ack,
                                 last_activity=time.time(),
-                                window_size=first_pkt_window,
+                                window_size=pkt_window * session.wscale,
+                                wscale=session.wscale
                             )
                             session = connections[client_key]
 
@@ -623,7 +631,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         client_seq=pkt_seq,
                         expected_final_ack=session.expected_final_ack,
                         last_activity=time.time(),
-                        window_size=first_pkt_window,
+                        window_size=first_pkt_window * session.wscale,
+                        wscale=client_ws
                     )
                     session = connections[client_key]
 
@@ -1225,6 +1234,29 @@ def close_all_connections():
         
         
 # Feature: Implement TCP flow control and window management
+def parse_tcp_window_scale(tcp_packet: bytes) -> int:
+    if len(tcp_packet) <= 20:
+        return 1
+    header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
+    options = tcp_packet[20:header_len]
+    i = 0
+    while i < len(options):
+        kind = options[i]
+        if kind == 0:
+            break
+        if kind == 1:
+            i += 1
+            continue
+        if i + 1 >= len(options):
+            break
+        opt_len = options[i + 1]
+        if opt_len < 2 or i + opt_len > len(options):
+            break
+        if kind == 3 and opt_len == 3:
+            return 1 << min(options[i + 2], 14)
+        i += opt_len
+    return 1
+
 def get_local_rwnd(recv_buffer, client_key) -> int:
     """Remaining free space in the local receive buffer."""
     recv_buffer.setdefault(client_key, {'in_order': bytearray(), 'out_of_order': {}})
@@ -1234,7 +1266,7 @@ def get_local_rwnd(recv_buffer, client_key) -> int:
     local_rwnd = max(0, free_bytes)
     return min(local_rwnd, DEFAULT_TCP_WINDOW_BYTES)
 
-  def update_rto(srtt, rttvar, sample_rtt):
+def update_rto(srtt, rttvar, sample_rtt):
     if srtt is None:
         srtt = sample_rtt
         rttvar = sample_rtt / 2.0
