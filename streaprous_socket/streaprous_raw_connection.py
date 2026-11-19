@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-MSS = 1460      
+MSS = 1460       # Leave room for IP/TCP headers within 1500B MTU
 MAX_RECV_BUFFER_BYTES = 65535
 DEFAULT_TCP_WINDOW_BYTES = 65535    # Max 16-bit TCP window size
 SEQ_NUMBER_MASK = 0xFFFFFFFF      # 32-bit sequence wrap mask
@@ -71,7 +71,7 @@ conn_struct = namedtuple('conn_struct', [
     'client_seq',
     'expected_final_ack',
     'last_activity',
-
+    'window_size',
 ])
 
 
@@ -475,7 +475,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_seq=2000,
                         client_seq=0,
                         expected_final_ack=0,
-                        last_activity=time.time()
+                        last_activity=time.time(),
+                        window_size=first_pkt_window,
                     )
                 session = connections[client_key]
 
@@ -518,7 +519,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_seq=server_seq,
                         client_seq=pkt_seq, 
                         expected_final_ack=server_seq + 1,
-                        last_activity=time.time()
+                        last_activity=time.time(),
+                        window_size=first_pkt_window
                     )
                     session = connections[client_key]
 
@@ -574,7 +576,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                                 server_seq=pkt_ack,
                                 client_seq=pkt_seq,
                                 expected_final_ack=session.expected_final_ack,
-                                last_activity=time.time()
+                                last_activity=time.time(),
+                                window_size=first_pkt_window,
                             )
                             session = connections[client_key]
 
@@ -616,7 +619,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_seq=pkt_ack,
                         client_seq=pkt_seq,
                         expected_final_ack=session.expected_final_ack,
-                        last_activity=time.time()
+                        last_activity=time.time(),
+                        window_size=first_pkt_window,
                     )
                     session = connections[client_key]
 
@@ -861,25 +865,30 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                     print(f"[Streap_raw] run_conn_send Connection lost for {client_ip}:{client_port}")
                     return -1
                 curr_session = connections[client_key]
-
+                curr_client_seq = curr_session.server_seq
+                
             while next_seq < target:
                 in_flight = next_seq - send_base
                 effective_window = min(cwnd, rwnd)
                 remaining_window = effective_window - in_flight
                 if remaining_window <= 0:
                     break
-                chunk_size = min(remaining_window, payload_len - offset, MSS) 
-                chunk = payload[offset:offset + chunk_size] 
+                chunk_size = min(remaining_window, payload_len - offset, MSS)
+                chunk = payload[offset:offset + chunk_size]
+                with connections_lock:
+                    local_rwnd = get_local_rwnd(recv_buffer=recv_buffers.setdefault, client_key=client_key)
                 bytes_sent = send_tcp_data_segment(
                     s, listen_ip, client_ip, listen_port, client_port,
-                    seq=next_seq, ack_seq=curr_session.client_seq, payload=chunk, window = effective_window
+                    seq=next_seq, ack_seq=curr_session.client_seq, payload=chunk, window = local_rwnd
                 )
         
                 print(f"[Streap_raw] run_conn_send Sent {bytes_sent} bytes to {client_ip}:{client_port}")
                 offset += bytes_sent
-                unacked_segments[next_seq] = [chunk, time.time(), False] 
+                unacked_segments[next_seq] = [chunk, time.time()]
                 next_seq += bytes_sent
                 
+                
+        
                 # Update sequence numbers
                 with connections_lock:
                     if client_key in connections:
@@ -970,6 +979,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                 # Some clients may not set PSH flag for small requests
                 has_data = len(tcp_packet) > ((tcp_packet[12] >> 4) & 0x0F) * 4
                 if (psh_flag and ack_flag) or (ack_flag and has_data and not syn_flag and not fin_flag and not rst_flag):
+                if ack_flag and has_data and not syn_flag and not rst_flag:
                     # # Dynamically look up header length to bypass any incoming TCP Options
                     # tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
                     # app_payload = tcp_packet[tcp_header_len:]
@@ -998,6 +1008,14 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                             
                     #     # Return the received payload
                     #     return app_payload
+                    if pkt_ack > send_base or (pkt_ack == send_base and pkt_window >= rwnd):
+                        rwnd = pkt_window 
+                        if (pkt_ack > send_base):
+                            send_base = pkt_ack
+                            dup_ack_count = 0
+                        for acked_seq in list(unacked_segments.keys()):
+                            if acked_seq <= pkt_ack:
+                                del unacked_segments[acked_seq]
                     packet_queue.put((packet, addr))  # Put back the packet for run_conn_recv to handle
                     continue
 
@@ -1018,6 +1036,20 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                                 del unacked_segments[acked_seq]
                     
                     elif pkt_ack == send_base:
+                if ack_flag and not syn_flag and not has_data:
+                    print(f"[Streap_raw] Received ACK from {client_ip}:{client_port} (Ack={pkt_ack})")
+                    
+                    if pkt_ack > send_base:
+                        rwnd = pkt_window 
+                        send_base = pkt_ack
+                        dup_ack_count = 0
+                        for acked_seq in list(unacked_segments.keys()):
+                            if acked_seq <= pkt_ack:
+                                del unacked_segments[acked_seq]
+                    
+                    elif pkt_ack == send_base:
+                          if pkt_window >= rwnd:
+                              rwnd = pkt_window
                           dup_ack_count += 1
                           if dup_ack_count == 3 and send_base in unacked_segments:
                               #Retransmit
@@ -1052,6 +1084,9 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                     dup_ack_count = 0
                     rto = min(rto * 2, MAX_RTO_SEC)
                     print(f"[Streap_raw] run_conn_send: Retransmitted segment at Seq={send_base} due to timeout")
+            except queue.Empty:
+                pass
+                
         
         return payload_len
         
@@ -1103,3 +1138,29 @@ def update_rto(srtt, rttvar, sample_rtt):
     
      
         
+# Feature: Implement TCP flow control and window management
+def get_local_rwnd(recv_buffer, client_key) -> int:
+    """Remaining free space in the local receive buffer."""
+    recv_buffer.setdefault(client_key, {'in_order': bytearray(), 'out_of_order': {}})
+    out_of_order_bytes = sum(len(chunk) for chunk in recv_buffer[client_key]['out_of_order'].values())
+    used_bytes = len(recv_buffer[client_key]['in_order']) + out_of_order_bytes
+    free_bytes = MAX_RECV_BUFFER_BYTES - used_bytes
+    local_rwnd = max(0, free_bytes)
+    return min(local_rwnd, DEFAULT_TCP_WINDOW_BYTES)
+
+def get_flight_size_bytes(self) -> int:
+    """Total unacknowledged bytes currently in flight."""
+    with self.lock:
+        return (self.next_send_seq - self.oldest_unacked_seq) & SEQ_NUMBER_MODULO
+
+def get_effective_window_bytes(self) -> int:
+    """Effective send window capped by cwnd and peer rwnd."""
+    with self.lock:
+        return min(int(self.cwnd_bytes), self.peer_rwnd)
+
+def get_available_send_bytes(self) -> int:
+    """Bytes we can transmit right now without exceeding the window."""
+    with self.lock:
+        effective_window = min(int(self.cwnd_bytes), self.peer_rwnd)
+        in_flight = (self.next_send_seq - self.oldest_unacked_seq) & SEQ_NUMBER_MODULO
+        return max(0, effective_window - in_flight)
