@@ -880,8 +880,8 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
     w_max = 0.0
     epoch_start = None
     cubic_k = 0.0
-    estimated_rtt = 0.1
-    dev_rtt = 0.05
+    estimated_rtt = None
+    dev_rtt = None
     timeout_interval = INITIAL_RTO_SEC
 # =======
     try:
@@ -927,12 +927,11 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
 
             #feature 2: arm probe timer when blocked
             #check if sender is blocked due to rwnd = 0 or expected_window = 0
-            effective_window = min(int(cwnd), rwnd)
-            if (rwnd == 0 or effective_window == 0) and send_base < target:
+            if rwnd == 0 and send_base < target:
                 if not probe_timer_armed:
                     probe_timer_armed = True
-                    rtt_sample = estimated_rtt if (estimated_rtt is not None and estimated_rtt > 0) else INITIAL_RTO_SEC
-                    probe_pto = calculate_pto(rtt=rtt_sample)
+                    rtt_deadlock = estimated_rtt if (estimated_rtt is not None and estimated_rtt > 0) else INITIAL_RTO_SEC
+                    probe_pto = calculate_pto(rtt=rtt_deadlock)
                     next_probe_deadline = time.time() + probe_pto
                     probe_count = 0
                     print(f"[Streap_raw] run_conn_send: Sender blocked, arming probe timer (PTO={probe_pto:.3f}s)")
